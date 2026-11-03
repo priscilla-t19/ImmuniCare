@@ -31,3 +31,7 @@ cd ..
 
 ## Security notes
 Local development only. Change demo passwords before sharing. The database port is bound to loopback. No authentication, patient records, or tenant isolation exist in Milestone 1; these are Milestone 2+ tasks. Never use real patient data.
+
+
+## Milestone 2
+See [README-MILESTONE2.md](README-MILESTONE2.md) for setup, API endpoints, tests, and security limitations.
