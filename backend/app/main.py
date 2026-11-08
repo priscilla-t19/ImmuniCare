@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from fastapi import FastAPI, Depends, HTTPException, Header, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
@@ -8,10 +8,10 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session as DbSession
 from .db import get_db
-from .models import User, Clinic, Membership, Session as AuthSession
+from .models import User, Clinic, Membership, Guardian, Patient, PatientGuardian, Session as AuthSession
 from .security import hash_password, verify_password, new_token, token_digest, expiration
 
-app = FastAPI(title='ImmuniCare API', version='0.2.0')
+app = FastAPI(title='ImmuniCare API', version='0.3.0')
 
 class RegisterClinic(BaseModel):
     clinic_name: str = Field(min_length=2, max_length=120)
@@ -144,3 +144,145 @@ def add_staff(clinic_id: str, payload: StaffCreate, membership=Depends(clinic_ac
         db.rollback()
         raise HTTPException(status_code=409, detail='Email already registered')
     return {'id':user.id,'email':user.email,'full_name':user.full_name,'role':payload.role}
+
+
+# Milestone 3: clinic-scoped patient and guardian records.
+# API responses intentionally do not include government identity numbers by default.
+class GuardianInput(BaseModel):
+    full_name: str = Field(min_length=2, max_length=120)
+    identity_number: str | None = Field(default=None, max_length=40)
+    phone: str | None = Field(default=None, max_length=32)
+
+class GuardianPatch(BaseModel):
+    full_name: str | None = Field(default=None, min_length=2, max_length=120)
+    phone: str | None = Field(default=None, max_length=32)
+
+class PatientInput(BaseModel):
+    full_name: str = Field(min_length=2, max_length=120)
+    birth_certificate_number: str = Field(min_length=2, max_length=60)
+    date_of_birth: date
+
+class PatientPatch(BaseModel):
+    full_name: str | None = Field(default=None, min_length=2, max_length=120)
+    date_of_birth: date | None = None
+
+class GuardianLink(BaseModel):
+    guardian_id: str
+    relationship_type: str = Field(min_length=2, max_length=40)
+
+def can_edit(membership):
+    if membership.role not in ('admin', 'clinician', 'receptionist'):
+        raise HTTPException(status_code=403, detail='Insufficient permission')
+
+def guardian_public(g):
+    return {'id':g.id,'clinic_id':g.clinic_id,'full_name':g.full_name,'phone':g.phone}
+
+def patient_public(p):
+    return {'id':p.id,'clinic_id':p.clinic_id,'full_name':p.full_name,
+            'birth_certificate_number':p.birth_certificate_number,'date_of_birth':p.date_of_birth.isoformat()}
+
+def check_birth_date(value):
+    if value > date.today():
+        raise HTTPException(status_code=422, detail='Date of birth cannot be in the future')
+
+def scoped(db, model, clinic_id, item_id):
+    item = db.scalar(select(model).where(model.id==item_id,model.clinic_id==clinic_id))
+    if item is None:
+        raise HTTPException(status_code=404, detail='Record not found')
+    return item
+
+@app.get('/clinics/{clinic_id}/guardians')
+def list_guardians(clinic_id: str, search: str = '', membership=Depends(clinic_access), db: DbSession=Depends(get_db)):
+    stmt = select(Guardian).where(Guardian.clinic_id==clinic_id)
+    if search.strip():
+        stmt = stmt.where(Guardian.full_name.ilike('%'+search.strip()[:120]+'%'))
+    return [guardian_public(g) for g in db.scalars(stmt.order_by(Guardian.full_name).limit(100))]
+
+@app.post('/clinics/{clinic_id}/guardians', status_code=201)
+def create_guardian(clinic_id: str, payload: GuardianInput, membership=Depends(clinic_access), db: DbSession=Depends(get_db)):
+    can_edit(membership)
+    g=Guardian(clinic_id=clinic_id,full_name=payload.full_name.strip(),
+              identity_number=payload.identity_number.strip() if payload.identity_number else None,
+              phone=payload.phone.strip() if payload.phone else None)
+    db.add(g)
+    try: db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409,detail='Guardian identity already exists in this clinic')
+    db.refresh(g)
+    return guardian_public(g)
+
+@app.get('/clinics/{clinic_id}/guardians/{guardian_id}')
+def get_guardian(clinic_id: str, guardian_id: str, membership=Depends(clinic_access), db: DbSession=Depends(get_db)):
+    return guardian_public(scoped(db,Guardian,clinic_id,guardian_id))
+
+@app.patch('/clinics/{clinic_id}/guardians/{guardian_id}')
+def update_guardian(clinic_id: str, guardian_id: str, payload: GuardianPatch, membership=Depends(clinic_access), db: DbSession=Depends(get_db)):
+    can_edit(membership)
+    g=scoped(db,Guardian,clinic_id,guardian_id)
+    for key,value in payload.model_dump(exclude_unset=True).items():
+        if value is None and key=='full_name':
+            raise HTTPException(status_code=422,detail='Full name cannot be null')
+        setattr(g,key,value.strip() if isinstance(value,str) else value)
+    db.commit()
+    return guardian_public(g)
+
+@app.get('/clinics/{clinic_id}/patients')
+def list_patients(clinic_id: str, search: str = '', membership=Depends(clinic_access), db: DbSession=Depends(get_db)):
+    stmt=select(Patient).where(Patient.clinic_id==clinic_id)
+    if search.strip():
+        stmt=stmt.where(Patient.full_name.ilike('%'+search.strip()[:120]+'%'))
+    return [patient_public(p) for p in db.scalars(stmt.order_by(Patient.full_name).limit(100))]
+
+@app.post('/clinics/{clinic_id}/patients', status_code=201)
+def create_patient(clinic_id: str, payload: PatientInput, membership=Depends(clinic_access), db: DbSession=Depends(get_db)):
+    can_edit(membership)
+    check_birth_date(payload.date_of_birth)
+    p=Patient(clinic_id=clinic_id,full_name=payload.full_name.strip(),
+              birth_certificate_number=payload.birth_certificate_number.strip(),date_of_birth=payload.date_of_birth)
+    db.add(p)
+    try: db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409,detail='Birth certificate number already exists in this clinic')
+    db.refresh(p)
+    return patient_public(p)
+
+@app.get('/clinics/{clinic_id}/patients/{patient_id}')
+def get_patient(clinic_id: str, patient_id: str, membership=Depends(clinic_access), db: DbSession=Depends(get_db)):
+    p=scoped(db,Patient,clinic_id,patient_id)
+    links=db.execute(select(PatientGuardian,Guardian).join(Guardian,PatientGuardian.guardian_id==Guardian.id).where(PatientGuardian.patient_id==p.id,PatientGuardian.clinic_id==clinic_id,Guardian.clinic_id==clinic_id)).all()
+    return {**patient_public(p),'guardians':[{**guardian_public(g),'relationship_type':link.relationship_type} for link,g in links]}
+
+@app.patch('/clinics/{clinic_id}/patients/{patient_id}')
+def update_patient(clinic_id: str, patient_id: str, payload: PatientPatch, membership=Depends(clinic_access), db: DbSession=Depends(get_db)):
+    can_edit(membership)
+    p=scoped(db,Patient,clinic_id,patient_id)
+    for key,value in payload.model_dump(exclude_unset=True).items():
+        if value is None:
+            raise HTTPException(status_code=422,detail='Patient fields cannot be null')
+        if key=='date_of_birth': check_birth_date(value)
+        setattr(p,key,value.strip() if isinstance(value,str) else value)
+    db.commit()
+    return patient_public(p)
+
+@app.post('/clinics/{clinic_id}/patients/{patient_id}/guardians',status_code=201)
+def link_guardian(clinic_id: str, patient_id: str, payload: GuardianLink, membership=Depends(clinic_access), db: DbSession=Depends(get_db)):
+    can_edit(membership)
+    scoped(db,Patient,clinic_id,patient_id)
+    scoped(db,Guardian,clinic_id,payload.guardian_id)
+    link=PatientGuardian(clinic_id=clinic_id,patient_id=patient_id,guardian_id=payload.guardian_id,relationship_type=payload.relationship_type.strip())
+    db.add(link)
+    try: db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409,detail='Guardian already linked to this patient')
+    return {'id':link.id,'patient_id':patient_id,'guardian_id':payload.guardian_id,'relationship_type':link.relationship_type}
+
+@app.delete('/clinics/{clinic_id}/patients/{patient_id}/guardians/{guardian_id}',status_code=204)
+def unlink_guardian(clinic_id: str,patient_id: str,guardian_id: str,membership=Depends(clinic_access),db: DbSession=Depends(get_db)):
+    can_edit(membership)
+    link=db.scalar(select(PatientGuardian).where(PatientGuardian.clinic_id==clinic_id,PatientGuardian.patient_id==patient_id,PatientGuardian.guardian_id==guardian_id))
+    if not link: raise HTTPException(status_code=404,detail='Relationship not found')
+    db.delete(link)
+    db.commit()
